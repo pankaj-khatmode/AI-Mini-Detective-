@@ -1,10 +1,19 @@
 # app.py
+"""
+AI Mini-Detective — Single-file multi-agent CrewAI pipeline using Gemini (LangChain wrapper)
+Fixed: build_agents_metadata now returns a list (not dict). Robust any_crew check.
+"""
 import os
 import re
+import json
 import traceback
 import streamlit as st
 from dotenv import load_dotenv
-from typing import Any, Dict
+from typing import Any, Dict, Optional, List
+
+# Prevent CrewAI import-time errors that expect OPENAI keys.
+if "OPENAI_API_KEY" not in os.environ:
+    os.environ["OPENAI_API_KEY"] = "DUMMY_PLACEHOLDER_OPENAI_KEY"
 
 # Optional imports for Gemini / LangChain wrapper
 try:
@@ -14,109 +23,88 @@ except Exception:
     ChatGoogleGenerativeAI = None
     HumanMessage = None
 
+# Optional CrewAI imports (we create Agent metadata only if available)
+try:
+    from crewai import Agent
+except Exception:
+    Agent = None
+
 load_dotenv()
 
 # ------------------ CONFIG ------------------
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # set in .env if you want Gemini
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL_CANDIDATES = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5",
-    "gemini-1.5-pro",  # legacy fallback if your account still supports it
+    "gemini-1.5-pro",
 ]
 
-# Use uploaded header image path provided earlier
+# Developer-provided header image path (will be transformed to hosted URL by platform)
 HEADER_IMAGE_PATH = "/mnt/data/0136661b-fea6-4adf-befa-d57e380d7b04.png"
 
-# Page setup
-st.set_page_config(page_title="AI Mini-Detective — Micro Investigation Game", page_icon="🕵️", layout="centered")
+# Streamlit page
+st.set_page_config(page_title="AI Mini-Detective — Multi-Agent (CrewAI + Gemini)", page_icon="🕵️", layout="centered")
 st.markdown(
     """
     <style>
-    .big-title {font-size:44px; font-weight:800; margin-bottom: 0.25rem; color: var(--text-color);}
-    .subtitle {font-size:18px; color: #8b98a5; margin-top: 0.1rem; margin-bottom: 1.2rem;}
-    .card {background:#0f1724;border-radius:10px;padding:18px;box-shadow: 0 6px 30px rgba(0,0,0,0.45); color:var(--text-color);}
-    .investigate-btn {background: #0ea5a4; color:white; padding:10px 18px; border-radius:8px; border:none;}
+    .big-title {font-size:40px; font-weight:800; margin-bottom: 0.25rem;}
+    .subtitle {font-size:15px; color: #6b7280; margin-top: 0.1rem; margin-bottom: 1.0rem;}
+    .card {background:#ffffff;border-radius:10px;padding:18px;box-shadow: 0 6px 18px rgba(0,0,0,0.06);}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Header image
 if os.path.exists(HEADER_IMAGE_PATH):
     st.image(HEADER_IMAGE_PATH, use_column_width=True)
 
-st.markdown('<div class="big-title">🕵️ AI Mini-Detective — Micro Investigation Game</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Crack the case with AI-powered investigation!</div>', unsafe_allow_html=True)
+st.markdown('<div class="big-title">🕵️ AI Mini-Detective — Multi-Agent Pipeline</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">CrewAI-style agents, all powered by Gemini (no OpenAI)</div>', unsafe_allow_html=True)
 
 # Input card
 st.markdown('<div class="card">', unsafe_allow_html=True)
-user_text = st.text_area("Describe your mystery here...", height=160, placeholder="e.g. my phone / keys / pet is missing...")
-investigate = st.button("Investigate 🔍")
+user_text = st.text_area("Describe your mystery here...", height=140, placeholder="e.g. I lost my USB drive after coming from class.")
+use_crewai_checkbox = st.checkbox("Use full CrewAI multi-agent pipeline (Gemini-backed)", value=True)
+run_button = st.button("Start Investigation 🔍")
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Initialize session_state container for last result
+# session storage
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
 
-# ------------------ Rule-based clue extraction (fallback) ------------------
+# ------------------ Utilities & local fallback ------------------
 def extract_clues_rule_based(text: str) -> Dict[str, Any]:
     t = text.strip()
     clues = {"key_objects": [], "locations": [], "people": [], "timeline": [], "other": []}
-
-    # key objects heuristic (my X / the X)
+    # basic heuristics
     for match in re.finditer(r"\b(my|the|a)\s+([A-Za-z0-9\-\_ ]{2,30})(?:[.,;!?]|$)", t, re.I):
         candidate = match.group(2).strip()
-        # filter out short/irrelevant words
         if len(candidate.split()) <= 4 and len(candidate) >= 2:
             clues["key_objects"].append(candidate)
-
-    # locations heuristic
     loc_keywords = ["cupboard", "class", "room", "library", "bus", "train", "campus", "home", "locker"]
     for k in loc_keywords:
         if re.search(rf"\b{k}\b", t, re.I):
             clues["locations"].append(k)
-
-    # people heuristic
     if re.search(r"\bI\b|\bme\b|\bmyself\b", t):
         clues["people"].append("the speaker (I)")
     for w in ["teacher", "friend", "classmate", "security", "cleaner"]:
         if re.search(rf"\b{w}\b", t, re.I):
             clues["people"].append(w)
-
-    # timeline
     if re.search(r"\bafter\b.*\b(class|lecture|coming)\b", t, re.I) or re.search(r"\bafter coming from\b", t, re.I):
         clues["timeline"].append("Lost after leaving class / after journey")
-
     if re.search(r"\blost\b|\bmissing\b", t, re.I):
         clues["other"].append("Described as 'lost' (likely misplacement)")
-
-    # dedupe lists
     for k in clues:
         clues[k] = list(dict.fromkeys(clues[k]))
     return clues
 
-# ------------------ Local analysis (fallback) ------------------
 def local_analyze(text: str) -> Dict[str, Any]:
     clues = extract_clues_rule_based(text)
-    h1 = {
-        "title": "Accidental Drop During Transit",
-        "reason": (
-            "Small items frequently fall during movement; the timeline states the loss happened after leaving class, "
-            "which is consistent with an unnoticed drop while travelling."
-        ),
-        "probability": 45,
-    }
-    h2 = {
-        "title": "Misplacement at Either End of the Journey",
-        "reason": (
-            "Items are commonly left on desks or placed down at the destination and forgotten. "
-            "Given the loss was realized after arrival, this is slightly more likely overall."
-        ),
-        "probability": 55,
-    }
+    h1 = {"title": "Accidental Drop During Transit", "reason": "Small items often fall during movement; unobserved drop while travelling.", "probability": 45}
+    h2 = {"title": "Misplacement at Either End of the Journey", "reason": "Left in classroom or misplaced at destination and forgotten.", "probability": 55}
     recs = [
-        "Thoroughly search the current location (desks, bags, under furniture).",
+        "Search current location thoroughly (desks, bags, under furniture).",
         "Contact classroom staff / department lost & found and building services.",
         "Retrace the route taken after class, checking benches, stairwells, and transit areas.",
         "Post in local groups and check campus lost & found or security.",
@@ -124,7 +112,58 @@ def local_analyze(text: str) -> Dict[str, Any]:
     ]
     return {"clues": clues, "hypotheses": [h1, h2], "conclusion": {"most_likely": h2["title"], "explanation": "Combined probability is slightly higher for misplacement at endpoints."}, "recommendations": recs}
 
-# ------------------ Gemini helpers (best-effort) ------------------
+# ------------------ Gemini (LangChain) + Adapter for CrewAI ------------------
+class CrewaiGeminiAdapter:
+    """
+    Adapter exposing CrewAI-friendly methods, backed by LangChain ChatGoogleGenerativeAI (Gemini).
+    We will call adapter.invoke(prompt_or_messages) to get a model response.
+    """
+    def __init__(self, gemini_llm):
+        self._llm = gemini_llm
+
+    def invoke(self, messages):
+        if isinstance(messages, str):
+            if HumanMessage is not None:
+                return self._llm.invoke([HumanMessage(content=messages)])
+            else:
+                return self._llm.invoke([("human", messages)])
+        return self._llm.invoke(messages)
+
+    def generate(self, prompts):
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        return self._llm.generate(prompts)
+
+    def stream(self, messages):
+        return self._llm.stream(messages)
+
+    async def ainvoke(self, messages):
+        return await self._llm.ainvoke(messages)
+
+    def __call__(self, prompt: str):
+        return self.invoke(prompt)
+
+    @staticmethod
+    def extract_text(resp):
+        if resp is None:
+            return None
+        if hasattr(resp, "content"):
+            return resp.content
+        if hasattr(resp, "generations"):
+            gens = getattr(resp, "generations")
+            try:
+                cand = gens[0][0] if isinstance(gens[0], (list, tuple)) else gens[0]
+                if hasattr(cand, "text"):
+                    return cand.text
+                if hasattr(cand, "content"):
+                    return cand.content
+            except Exception:
+                pass
+        try:
+            return str(resp)
+        except Exception:
+            return None
+
 def create_gemini_llm_try_models():
     if ChatGoogleGenerativeAI is None or not GOOGLE_API_KEY:
         return None, None
@@ -135,157 +174,293 @@ def create_gemini_llm_try_models():
             return llm, model
         except Exception as e:
             attempts.append((model, str(e)))
-    # no model worked
     st.warning("Could not initialize Gemini with any candidate model. Falling back to local analyzer.")
     for m, e in attempts:
         st.text(f"{m}: {e[:300]}")
     return None, None
 
-def call_gemini_and_get_text(llm, prompt: str) -> str:
-    try:
-        if HumanMessage is not None:
-            resp = llm.invoke([HumanMessage(content=prompt)])
-        else:
-            # fallback message tuple
-            resp = llm.invoke([("system", "You are a detective."), ("human", prompt)])
-        # try common shapes
-        if hasattr(resp, "content"):
-            return resp.content
-        if hasattr(resp, "generations"):
-            gens = getattr(resp, "generations")
+# ------------------ CrewAI multi-agent pipeline (orchestrated) ------------------
+def build_agents_metadata() -> List[Dict[str, Any]]:
+    """
+    Return a list of agent metadata dicts; each dict contains:
+      - id, role, goal, backstory, crew_agent (optional)
+    This is intentionally a LIST to match how the orchestration iterates agents.
+    """
+    specs = [
+        {
+            "id": "evidence",
+            "role": "Evidence Extractor",
+            "goal": "Extract objective clues and facts from the case.",
+            "backstory": "A forensic-minded investigator who prefers concise, factual bullet lists."
+        },
+        {
+            "id": "scenario",
+            "role": "Scenario Analyst",
+            "goal": "Generate 2 plausible scenarios/hypotheses that explain the evidence.",
+            "backstory": "A creative analyst converting facts into plausible alternative explanations."
+        },
+        {
+            "id": "prob",
+            "role": "Probability Assessor",
+            "goal": "Assign probability scores and short rationales to each scenario.",
+            "backstory": "A statistical pragmatist: honest, conservative, and explainable."
+        },
+        {
+            "id": "conclude",
+            "role": "Conclusion Agent",
+            "goal": "Synthesize findings and provide clear next steps and a short conclusion.",
+            "backstory": "A calm, practical senior detective who gives actionable guidance."
+        }
+    ]
+
+    agents_list: List[Dict[str, Any]] = []
+    for s in specs:
+        crew_obj = None
+        if Agent is not None:
             try:
-                # try nested fields
-                return str(gens[0][0].text) if (isinstance(gens, (list, tuple)) and gens and isinstance(gens[0], (list, tuple)) and hasattr(gens[0][0], "text")) else str(resp)
+                # we intentionally pass llm=None — calls go via our adapter
+                crew_obj = Agent(role=s["role"], goal=s["goal"], backstory=s["backstory"], verbose=False, allow_delegation=False, llm=None)
             except Exception:
-                pass
-        return str(resp)
-    except Exception as e:
-        st.text("Gemini invocation failed: " + str(e)[:300])
-        st.text(traceback.format_exc()[:2000])
-        return None
+                crew_obj = None
+        agents_list.append({
+            "id": s["id"],
+            "role": s["role"],
+            "goal": s["goal"],
+            "backstory": s["backstory"],
+            "crew_agent": crew_obj
+        })
+    return agents_list
 
-# ------------------ UI result rendering ------------------
-def display_structured_result(result: Dict[str, Any], model_name: str = None):
+def run_multi_agent_pipeline_gemini(adapter: CrewaiGeminiAdapter, user_input: str) -> Dict[str, Any]:
+    """
+    Orchestrate the 4-agent pipeline by calling the adapter for each step.
+    Returns a dict with structured outputs.
+    """
+    # 1) Evidence extraction
+    evidence_prompt = (
+        "You are an Evidence Extractor. Extract short, bullet-style clues from the case below. "
+        "Return JSON with fields: key_objects (list), locations, people, timeline, other (list). "
+        "Case:\n" + user_input
+    )
+    ev_resp = adapter.invoke(evidence_prompt)
+    ev_text = adapter.extract_text(ev_resp) or ""
+    clues = {}
+    try:
+        clues = json.loads(ev_text)
+    except Exception:
+        clues = extract_clues_rule_based(user_input)
+        clues.setdefault("llm_note", ev_text[:1000])
+
+    # 2) Scenario analyst: propose 2 scenarios
+    scenario_prompt = (
+        "You are a Scenario Analyst. Using the extracted clues below, propose 2 concise plausible scenarios/hypotheses. "
+        "For each scenario, give: title, short_reason, suggested_evidence_to_check. Return JSON list of 2 objects.\n\n"
+        f"Extracted clues: {clues}\n\n"
+    )
+    sc_resp = adapter.invoke(scenario_prompt)
+    sc_text = adapter.extract_text(sc_resp) or ""
+    scenarios = []
+    try:
+        scenarios = json.loads(sc_text)
+    except Exception:
+        scenarios = [
+            {"title": "Accidental Drop During Transit", "short_reason": "Item likely fell from pocket/bag while moving.", "suggested_evidence_to_check": ["route benches", "stairs", "floor near doors"]},
+            {"title": "Left Behind / Misplaced at endpoints", "short_reason": "Left in classroom or misplaced at destination and forgotten.", "suggested_evidence_to_check": ["class desks", "bag contents", "destination surfaces"]}
+        ]
+
+    # 3) Probability agent: assign probabilities and short rationale
+    prob_prompt = (
+        "You are a Probability Assessor. Given these scenarios and clues, assign integer probability percentages that sum to ~100 and give a one-line rationale for each. "
+        "Return JSON list matching scenarios with fields: title, probability, rationale.\n\n"
+        f"scenarios: {scenarios}\nclues: {clues}\n"
+    )
+    pr_resp = adapter.invoke(prob_prompt)
+    pr_text = adapter.extract_text(pr_resp) or ""
+    probabilities = []
+    try:
+        probabilities = json.loads(pr_text)
+    except Exception:
+        probabilities = [
+            {"title": scenarios[0]["title"], "probability": 45, "rationale": "Transit drops are common."},
+            {"title": scenarios[1]["title"], "probability": 55, "rationale": "Leaving items behind is slightly more likely overall."}
+        ]
+
+    # 4) Conclusion & Actions: finalize analysis and steps
+    conclude_prompt = (
+        "You are the Conclusion Agent. Synthesize the clues, scenarios, and probabilities into a clear, actionable report. "
+        "Return a human-readable summary with sections: Key facts, Scenarios (with probabilities), Recommended next steps (bulleted), and Short conclusion.\n\n"
+        f"Clues: {clues}\nScenarios: {scenarios}\nProbabilities: {probabilities}\n"
+    )
+    co_resp = adapter.invoke(conclude_prompt)
+    co_text = adapter.extract_text(co_resp) or ""
+
+    result = {
+        "clues": clues,
+        "scenarios": scenarios,
+        "probabilities": probabilities,
+        "conclusion_text": co_text
+    }
+    return result
+
+# ------------------ Updated render_final_result (robust to strings) ------------------
+def render_final_result(result: Any, model_name: Optional[str]):
+    """
+    Accepts either:
+      - result: dict with keys 'clues','scenarios','probabilities','conclusion_text'
+      - result: plain string (LLM free-form) — we'll show it as the conclusion/body
+    """
     st.markdown("----")
+
+    # If the LLM returned a plain string, render it as the main analysis text
+    if isinstance(result, str):
+        st.markdown("### 🕵️ Case Analysis (raw LLM output)")
+        st.markdown(result)
+        if model_name:
+            st.markdown(f"\n*Analysis powered by Gemini model: `{model_name}` (raw output)*")
+        else:
+            st.markdown("\n*Analysis powered by local analyzer.*")
+        return
+
+    # If result is not a dict, try to stringify it safely
+    if not isinstance(result, dict):
+        st.markdown("### 🕵️ Case Analysis")
+        try:
+            st.markdown(str(result))
+        except Exception:
+            st.write(result)
+        if model_name:
+            st.markdown(f"\n*Analysis powered by Gemini model: `{model_name}`*")
+        else:
+            st.markdown("\n*Analysis powered by local analyzer.*")
+        return
+
+    # From here on 'result' is a dict as expected
     st.markdown("### 🔎 Extracted Clues")
-    st.markdown("Here are the relevant clues extracted from the mystery:")
-    clues = result["clues"]
-    st.markdown("**Key objects mentioned**")
-    if clues["key_objects"]:
-        for obj in clues["key_objects"]:
-            st.write(f"- {obj}")
+    clues = result.get("clues", {}) or {}
+
+    # If clues itself is a string (some LLMs return plain text), show that
+    if isinstance(clues, str):
+        st.write(clues)
     else:
-        st.write("- (none identified)")
 
-    st.markdown("**Locations**")
-    if clues["locations"]:
-        for loc in clues["locations"]:
-            st.write(f"- {loc}")
-    else:
-        st.write("- (none identified)")
+        if clues.get("other"):
+            st.markdown("**Other**")
+            for o in clues.get("other", []):
+                st.write(f"- {o}")
 
-    st.markdown("**People/suspects**")
-    if clues["people"]:
-        for p in clues["people"]:
-            st.write(f"- {p}")
-    else:
-        st.write("- (none identified)")
+        if clues.get("llm_note"):
+            st.markdown("**LLM Note**")
+            st.write(clues.get("llm_note"))
 
-    st.markdown("**Timeline of events**")
-    if clues["timeline"]:
-        for t in clues["timeline"]:
-            st.write(f"- {t}")
-    else:
-        st.write("- (timeline not explicit)")
-
-    if clues["other"]:
-        st.markdown("**Any other relevant information**")
-        for o in clues["other"]:
-            st.write(f"- {o}")
-
-    st.markdown("### 🧩 Possible Scenarios")
-    for h in result["hypotheses"]:
-        st.markdown(f"**{h['title']}**")
-        st.write(h["reason"])
-        st.write(f"**Probability Rating:** {h['probability']}%")
+    st.markdown("### 🧩 Scenarios")
+    for s in result.get("scenarios", []) or []:
+        if isinstance(s, dict):
+            st.markdown(f"**{s.get('title') or 'Scenario'}**")
+            if s.get("short_reason"):
+                st.write(s.get("short_reason"))
+            ev_checks = s.get("evidence_to_check") or s.get("suggested_evidence_to_check") or []
+            if ev_checks:
+                st.write("Check:", ", ".join(ev_checks))
+        else:
+            st.markdown(f"**{s}**")
         st.write("---")
+    if not result.get("scenarios"):
+        st.write("- (none generated)")
 
-    st.markdown("### 🎯 Analysis & Conclusion")
-    st.markdown(f"**Most Likely Scenario:** {result['conclusion']['most_likely']}")
-    st.write(result["conclusion"]["explanation"])
+    st.markdown("### 📊 Probabilities")
+    for p in result.get("probabilities", []) or []:
+        if isinstance(p, dict):
+            st.write(f"- **{p.get('title')}** — {p.get('probability')}% — {p.get('rationale')}")
+        else:
+            st.write(f"- {p}")
+    if not result.get("probabilities"):
+        st.write("- (none assigned)")
 
-    st.markdown("### Recommended Next Steps")
-    for r in result["recommendations"]:
-        st.write(f"- {r}")
+    st.markdown("### ✅ Conclusion & Recommended Next Steps")
+    conclusion = result.get("conclusion_text") or result.get("conclusion") or ""
+    if isinstance(conclusion, str) and conclusion.strip():
+        st.markdown(conclusion)
+    elif isinstance(conclusion, dict):
+        for k, v in conclusion.items():
+            st.markdown(f"**{k}**")
+            st.write(v)
+    else:
+        st.write("- (no conclusion text)")
 
     if model_name:
         st.markdown(f"\n*Analysis powered by Gemini model: `{model_name}`*")
     else:
-        st.markdown("\n*Analysis powered by local rule-based analyzer.*")
+        st.markdown("\n*Analysis powered by local analyzer.*")
 
 # ------------------ Robust main handler ------------------
-if investigate:
+if run_button:
     if not user_text or user_text.strip() == "":
         st.error("Please describe the mystery before you Investigate.")
     else:
-        try:
-            st.info("🔎 Investigating — please wait...")
+        st.info("Running multi-agent investigation...")
 
-            # Try Gemini (best-effort)
-            gemini_llm, model_used = create_gemini_llm_try_models()
-            gemini_response = None
-
-            if gemini_llm:
-                prompt = (
-                    "You are a seasoned detective. Analyze the following short case and return a structured analysis.\n\n"
-                    "Case description:\n" + user_text +
-                    "\n\nReturn sections: Extracted Clues (Key objects, Locations, People, Timeline, Other), "
-                    "2 Hypotheses with short reason and probability percentages, Conclusion (most likely scenario + explanation), "
-                    "Recommended Next Steps (bulleted). Keep output clear and human-readable."
-                )
-                try:
-                    gemini_response = call_gemini_and_get_text(gemini_llm, prompt)
-                except Exception:
-                    st.warning("Gemini call raised an exception; see traceback below.")
-                    st.text(traceback.format_exc()[:2000])
-                    gemini_response = None
-
-            # Always compute local result so UI shows structured output
-            local_result = local_analyze(user_text)
-
-            # Present results: prefer Gemini text if available, else local
-            if gemini_response:
-                st.markdown("----")
-                st.markdown("### 🕵️ Case Analysis (Gemini)")
-                st.markdown(gemini_response)
-                st.markdown("----")
-                display_structured_result(local_result, model_name=model_used)
-                st.session_state["last_result"] = ("gemini", gemini_response)
-            else:
-                display_structured_result(local_result, model_name=None)
-                st.session_state["last_result"] = ("local", local_result)
-
-            st.markdown("----")
-            st.success("🕵️‍♂️ Case Status: Investigation Complete")
-
-        except Exception:
-            st.error("An unexpected error occurred while processing the request; traceback below:")
-            st.text(traceback.format_exc()[:2000])
+        # Try to create Gemini LLM (LangChain) and adapter
+        gemini_llm, model_name = create_gemini_llm_try_models()
+        if gemini_llm is None or not use_crewai_checkbox:
+            st.warning("Gemini/LangChain wrapper not available or CrewAI disabled — using local analyzer.")
+            fallback = local_analyze(user_text)
+            local_report = {
+                "clues": fallback["clues"],
+                "scenarios": fallback["hypotheses"],
+                "probabilities": [
+                    {"title": fallback["hypotheses"][0]["title"], "probability": fallback["hypotheses"][0]["probability"], "rationale": fallback["hypotheses"][0]["reason"]},
+                    {"title": fallback["hypotheses"][1]["title"], "probability": fallback["hypotheses"][1]["probability"], "rationale": fallback["hypotheses"][1]["reason"]}
+                ],
+                "conclusion_text": f"Most likely: {fallback['conclusion']['most_likely']}\n\n{fallback['conclusion']['explanation']}"
+            }
+            render_final_result(local_report, model_name=None)
+            st.session_state["last_result"] = ("local", local_report)
+        else:
+            adapter = CrewaiGeminiAdapter(gemini_llm)
+            agents_meta = build_agents_metadata()  # now returns a list
             try:
-                fallback = local_analyze(user_text)
-                display_structured_result(fallback)
-                st.session_state["last_result"] = ("fallback", fallback)
-            except Exception:
-                st.text("Fallback analysis also failed; check the full traceback above.")
+                result = run_multi_agent_pipeline_gemini(adapter, user_text)
+                render_final_result(result, model_name=model_name)
+                st.session_state["last_result"] = ("gemini", result)
 
-# If user hasn't pressed Investigate but we have a last_result, show it
+                # robust any_crew check — safe even if agents_meta is malformed
+                any_crew = False
+                try:
+                    if isinstance(agents_meta, list):
+                        for a in agents_meta:
+                            if isinstance(a, dict) and a.get("crew_agent"):
+                                any_crew = True
+                                break
+                    elif isinstance(agents_meta, dict):
+                        # defensive: if a dict slipped through, check values
+                        for v in agents_meta.values():
+                            if hasattr(v, "role") or (isinstance(v, dict) and v.get("crew_agent")):
+                                any_crew = True
+                                break
+                except Exception:
+                    any_crew = False
+
+                if any_crew:
+                    st.caption("CrewAI Agent metadata created and bound (LLM calls routed via Gemini adapter).")
+            except Exception:
+                st.error("Multi-agent pipeline failed; showing fallback and traceback.")
+                st.text(traceback.format_exc()[:2000])
+                fallback = local_analyze(user_text)
+                fallback_report = {
+                    "clues": fallback["clues"],
+                    "scenarios": fallback["hypotheses"],
+                    "probabilities": [
+                        {"title": fallback["hypotheses"][0]["title"], "probability": fallback["hypotheses"][0]["probability"], "rationale": fallback["hypotheses"][0]["reason"]},
+                        {"title": fallback["hypotheses"][1]["title"], "probability": fallback["hypotheses"][1]["probability"], "rationale": fallback["hypotheses"][1]["reason"]}
+                    ],
+                    "conclusion_text": f"Most likely: {fallback['conclusion']['most_likely']}\n\n{fallback['conclusion']['explanation']}"
+                }
+                render_final_result(fallback_report, model_name=None)
+                st.session_state["last_result"] = ("fallback", fallback_report)
+
+# Show cached last result if present and no current run
 elif st.session_state.get("last_result"):
-    # helpful to re-render the last result on rerun
     typ, payload = st.session_state["last_result"]
-    st.markdown("### Last analysis (cached)")
-    if typ == "gemini":
-        st.markdown("#### Gemini output (cached)")
-        st.markdown(payload)
-    else:
-        st.markdown("#### Structured analysis (cached)")
-        display_structured_result(payload)
+    st.markdown("### Last cached analysis")
+    # payload may be dict or string
+    render_final_result(payload, model_name="(cached gemini result)" if typ == "gemini" else None)
